@@ -224,13 +224,26 @@ impl State {
         print_locality_stats(&layout, &graph);
 
         let edge_verts = build_edge_vertices(&layout, &graph);
-        let renderer = Renderer::new(window.clone(), &layout, &families, edge_verts).await;
+        let mut renderer = Renderer::new(window.clone(), &layout, &families, edge_verts).await;
 
         let n = layout.layouts.len() as f32;
         let focus = layout.layouts.iter().map(|fl| fl.center).fold(Vec3::ZERO, |a, c| a + c) / n;
         let max_dist = layout.layouts.iter().map(|fl| (fl.center - focus).length())
             .fold(0.0_f32, f32::max);
         let camera = Camera::new(focus, 0.3, 0.25, max_dist * 2.2);
+
+        // Axis label anchors: tips of the three semantic axes (same scale as renderer axis lines).
+        let ext = max_dist * 1.5;
+        let (cx, cy, cz) = (focus.x, focus.y, focus.z);
+        let axis_labels: &[(Vec3, &str)] = &[
+            (Vec3::new(cx - ext, cy, cz), "Start"),
+            (Vec3::new(cx + ext, cy, cz), "End"),
+            (Vec3::new(cx, cy + ext, cz), "White"),
+            (Vec3::new(cx, cy - ext, cz), "Black"),
+            (Vec3::new(cx, cy, cz + ext), "Pawns16"),
+            (Vec3::new(cx, cy, cz - ext), "Pawns0"),
+        ];
+        renderer.update_label_instances(axis_labels);
 
         eprintln!("GPU renderer ready — entering event loop");
         eprintln!("Axes (lines through cloud centroid):");

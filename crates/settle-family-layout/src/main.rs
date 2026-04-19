@@ -25,7 +25,8 @@ fn main() {
     // viewer's interactive default.  Freeze the result into the static artifact.
     let config = LayoutConfig {
         iterations: 400,
-        repulsion_distance: 10.0,
+        repulsion_distance: 12.0,  // wider search radius for he-scaled repulsion
+        anchor_strength: 0.4,      // slightly stronger anchor to keep axis semantics
         max_step: 0.3,
         ..LayoutConfig::default()
     };

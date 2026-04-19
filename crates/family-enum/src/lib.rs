@@ -168,6 +168,84 @@ pub const WNP_MIN_PIECES_REMOVED: [u32; 9] = [
     0, // band 8 [27–31]: full starting set
 ];
 
+fn binary_entropy(p: f32) -> f32 {
+    if p <= 0.0 || p >= 1.0 { return 0.0; }
+    -p * p.log2() - (1.0 - p) * (1.0 - p).log2()
+}
+
+/// Weighted strategic entropy S(F) over the exact admissible piece-count
+/// realizations inside a family identified by (wnp_band, bnp_band).
+///
+/// Enumerates all (wQ,wR,wB,wN) × (bQ,bR,bB,bN) pairs (Q∈{0,1}, R/B/N∈{0,1,2})
+/// whose NP point totals land in the respective bands, then computes five binary
+/// strategic indicators and returns their weighted entropy sum.
+/// Result depends only on (wnp_band, bnp_band); pawn counts do not affect it.
+pub fn strategic_entropy_score(wnp_band: u8, bnp_band: u8) -> f32 {
+    let wband = &BAND_TABLE[wnp_band as usize];
+    let bband = &BAND_TABLE[bnp_band as usize];
+
+    let mut white: Vec<(u8, u8, u8, u8)> = Vec::new(); // (wQ, wR, wB, wN)
+    for wq in 0u8..=1 {
+        for wr in 0u8..=2 {
+            for wb in 0u8..=2 {
+                for wn in 0u8..=2 {
+                    let v = 9 * wq + 5 * wr + 3 * wb + 3 * wn;
+                    if v >= wband.lo && v <= wband.hi {
+                        white.push((wq, wr, wb, wn));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut black: Vec<(u8, u8, u8, u8)> = Vec::new(); // (bQ, bR, bB, bN)
+    for bq in 0u8..=1 {
+        for br in 0u8..=2 {
+            for bb in 0u8..=2 {
+                for bn in 0u8..=2 {
+                    let v = 9 * bq + 5 * br + 3 * bb + 3 * bn;
+                    if v >= bband.lo && v <= bband.hi {
+                        black.push((bq, br, bb, bn));
+                    }
+                }
+            }
+        }
+    }
+
+    let n = (white.len() * black.len()) as f32;
+    if n == 0.0 { return 0.0; }
+
+    let mut cnt_q_any = 0u32;
+    let mut cnt_r_any = 0u32;
+    let mut cnt_m_rich = 0u32;
+    let mut cnt_bp_any = 0u32;
+    let mut cnt_h_dom = 0u32;
+
+    for &(wq, wr, wb, wn) in &white {
+        for &(bq, br, bb, bn) in &black {
+            if wq + bq > 0 { cnt_q_any += 1; }
+            if wr + br > 0 { cnt_r_any += 1; }
+            if (wb + wn + bb + bn) >= 3 { cnt_m_rich += 1; }
+            if wb == 2 || bb == 2 { cnt_bp_any += 1; }
+            let heavy = 5 * (wr + br) as u32 + 9 * (wq + bq) as u32;
+            let minor = 3 * (wb + wn + bb + bn) as u32;
+            if heavy > minor { cnt_h_dom += 1; }
+        }
+    }
+
+    let p_q  = cnt_q_any  as f32 / n;
+    let p_r  = cnt_r_any  as f32 / n;
+    let p_m  = cnt_m_rich as f32 / n;
+    let p_bp = cnt_bp_any as f32 / n;
+    let p_h  = cnt_h_dom  as f32 / n;
+
+    1.50 * binary_entropy(p_q)
+        + 1.50 * binary_entropy(p_r)
+        + 1.00 * binary_entropy(p_m)
+        + 1.00 * binary_entropy(p_bp)
+        + 1.25 * binary_entropy(p_h)
+}
+
 /// Count of distinct starting-limit NP piece-count tuples (wn,wb,wr,wq)
 /// with wn,wb,wr ∈ 0..=2, wq ∈ 0..=1 whose value (3wn+3wb+5wr+9wq)
 /// falls in the band's [lo, hi] range.
@@ -218,6 +296,13 @@ pub struct FamilyFeatures {
     /// = WNP_MIN_PIECES_REMOVED[wnp_band] + WNP_MIN_PIECES_REMOVED[bnp_band]
     ///   + (8 − wp) + (8 − bp). Returns 0 for the starting family.
     pub min_capture_bound: u32,
+    /// Weighted strategic entropy over the exact admissible piece-count
+    /// realizations inside this family. Measures how many distinct strategic
+    /// regimes (queen game, rook game, minor-piece game, bishop-pair, heavy
+    /// dominance) coexist within the family's composition space.
+    /// High = strategically mixed (many regimes present); low = type-pure.
+    /// Depends only on (wnp_band, bnp_band); pawn counts do not affect it.
+    pub strategic_entropy: f32,
 }
 
 /// One row in the family table: key + derived features + composition prior.
@@ -278,6 +363,9 @@ pub fn build_table() -> Vec<FamilyRecord> {
                         pawn_imbalance: (wp as f32 - bp as f32) / 8.0,
                     };
 
+                    let strategic_entropy =
+                        strategic_entropy_score(wnp_band, bnp_band);
+
                     records.push(FamilyRecord {
                         key,
                         features: FamilyFeatures {
@@ -290,6 +378,7 @@ pub fn build_table() -> Vec<FamilyRecord> {
                             feature_span,
                             family_mass_prior,
                             min_capture_bound,
+                            strategic_entropy,
                         },
                         mode,
                     });

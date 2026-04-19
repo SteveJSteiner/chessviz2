@@ -135,6 +135,17 @@ pub fn compute(
         })
         .collect();
 
+    // ── Per-family he (strategic entropy → billboard radius) ─────────────────
+    // Computed here so the FD repulsion can scale with sphere size: larger
+    // families push harder and claim proportionally more room.
+    const HE_MIN: f32 = 0.15;
+    const HE_MAX: f32 = 1.2;
+    let s_max = families.iter().map(|r| r.features.strategic_entropy).fold(0.0_f32, f32::max);
+    let he_values: Vec<f32> = families.iter().map(|r| {
+        let s = r.features.strategic_entropy;
+        if s_max > 0.0 { HE_MIN + (HE_MAX - HE_MIN) * (s / s_max) } else { HE_MIN }
+    }).collect();
+
     // ── Force-directed refinement ─────────────────────────────────────────────
     if config.iterations > 0 {
         // Record seed positions before jitter — used by the anchor force to
@@ -174,7 +185,10 @@ pub fn compute(
                             let delta = pi - positions[j];
                             let d2 = delta.length_squared();
                             if d2 < 1e-8 || d2 > rep_dist_sq { continue; }
-                            f += delta * (config.repulsion_strength / d2);
+                            // Scale repulsion by combined sphere size: large
+                            // families push harder and naturally claim more room.
+                            let he_scale = (he_values[i] + he_values[j]) / (2.0 * HE_MIN);
+                            f += delta * (config.repulsion_strength * he_scale / d2);
                         }
                         f
                     })
@@ -216,13 +230,13 @@ pub fn compute(
     let layouts = families
         .iter()
         .enumerate()
-        .map(|(i, rec)| {
-            let span = rec.features.feature_span;
+        .map(|(i, _rec)| {
+            let he = he_values[i];
             FamilyLayout {
                 center: positions[i],
                 orientation: Mat3::IDENTITY,
                 extent_budget: ExtentBudget {
-                    he: 0.4 + 0.1 * span,
+                    he,
                     hn: 0.5,
                     hr: 0.5,
                 },
@@ -354,15 +368,30 @@ mod tests {
     }
 
     #[test]
-    fn extent_budget_scales_with_feature_span() {
+    fn extent_budget_scales_with_strategic_entropy() {
         let (families, _, table) = setup();
-        let wide = FamilyKey { wnp_band: 7, bnp_band: 3, wp: 0, bp: 0 }.index();
-        let narrow = FamilyKey { wnp_band: 0, bnp_band: 0, wp: 0, bp: 0 }.index();
+        // Bare-kings family (wnp_band=0, bnp_band=0) is type-pure: entropy=0 → he=HE_MIN.
+        let bare = FamilyKey { wnp_band: 0, bnp_band: 0, wp: 0, bp: 0 }.index();
+        // A mid-game family with mixed bands should have higher entropy → larger he.
+        let mid = FamilyKey { wnp_band: 5, bnp_band: 5, wp: 4, bp: 4 }.index();
         assert!(
-            table.layouts[wide].extent_budget.he > table.layouts[narrow].extent_budget.he,
-            "wider band should have larger he"
+            table.layouts[mid].extent_budget.he > table.layouts[bare].extent_budget.he,
+            "mixed-band family should have larger he than type-pure bare-kings family"
         );
-        let expected_he = 0.4 + 0.1 * families[wide].features.feature_span;
-        assert!((table.layouts[wide].extent_budget.he - expected_he).abs() < 1e-5);
+        // All he values must lie in [HE_MIN, HE_MAX].
+        for (i, layout) in table.layouts.iter().enumerate() {
+            let he = layout.extent_budget.he;
+            assert!(he >= 0.15 - 1e-5 && he <= 1.2 + 1e-5,
+                "he={he} at index {i} outside [0.15, 1.2]");
+        }
+        // Entropy depends only on (wnp_band, bnp_band); two families sharing those bands
+        // but differing in pawn counts must have identical he.
+        let a = FamilyKey { wnp_band: 5, bnp_band: 3, wp: 2, bp: 6 }.index();
+        let b = FamilyKey { wnp_band: 5, bnp_band: 3, wp: 6, bp: 2 }.index();
+        assert_eq!(
+            families[a].features.strategic_entropy,
+            families[b].features.strategic_entropy,
+            "strategic entropy must be pawn-independent"
+        );
     }
 }

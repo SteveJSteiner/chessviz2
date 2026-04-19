@@ -1,7 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use family_enum::FamilyRecord;
 use family_graph::EdgeType;
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -11,6 +11,17 @@ use crate::font::make_font;
 use crude_layout::LayoutTable;
 
 const MAX_GLYPHS: u64 = 512;
+const MAX_LABEL_INSTANCES: u64 = 16;
+
+// Per-instance label billboard data (64 bytes, 4 × vec4).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct LabelInstance {
+    pub center_hw: [f32; 4],  // xyz = world center, w = half_width
+    pub hh_nc:     [f32; 4],  // x = half_height, y = n_chars (as f32), zw = 0
+    pub chars01:   [u32; 4],  // ASCII codes for chars 0–3
+    pub chars23:   [u32; 4],  // ASCII codes for chars 4–7
+}
 
 // ── Color modes ───────────────────────────────────────────────────────────────
 
@@ -192,6 +203,11 @@ pub struct Renderer {
     text_glyphs_buf: wgpu::Buffer,
     text_params_buf: wgpu::Buffer,
     text_glyph_count: u32,
+
+    label_pipeline:      wgpu::RenderPipeline,
+    label_instance_buf:  wgpu::Buffer,
+    font_bind_group:     wgpu::BindGroup,
+    n_label_instances:   u32,
 
     pub color_mode: ColorMode,
     pub show_edges: bool,
@@ -438,7 +454,7 @@ impl Renderer {
         let cx = centroid.x;
         let cy = centroid.y;
         let cz = centroid.z;
-        let ext = max_dist * 0.8;
+        let ext = max_dist * 1.5;
         let red   = [1.0_f32, 0.25, 0.25, 1.0];
         let green = [0.25_f32, 1.0, 0.35, 1.0];
         let blue  = [0.35_f32, 0.55, 1.0, 1.0];
@@ -531,6 +547,89 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 2, resource: text_params_buf.as_entire_binding() },
             ],
         });
+
+        // ── Label billboard pipeline ────────────────────────────────────────
+        // Bind group 1 for the label pipeline: just the font storage buffer.
+        let font_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("font_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let font_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("font_bg"),
+            layout: &font_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: font_buf.as_entire_binding(),
+            }],
+        });
+        let label_instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("label_instances"),
+            size: MAX_LABEL_INSTANCES * std::mem::size_of::<LabelInstance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let label_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("label_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("label_shader.wgsl").into()),
+        });
+        let label_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&camera_bgl, &font_bgl],
+            push_constant_ranges: &[],
+        });
+        let label_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("label"),
+            layout: Some(&label_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &label_shader,
+                entry_point: "vs_label",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<LabelInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[
+                        wgpu::VertexAttribute { offset:  0, shader_location: 0, format: wgpu::VertexFormat::Float32x4 },
+                        wgpu::VertexAttribute { offset: 16, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                        wgpu::VertexAttribute { offset: 32, shader_location: 2, format: wgpu::VertexFormat::Uint32x4  },
+                        wgpu::VertexAttribute { offset: 48, shader_location: 3, format: wgpu::VertexFormat::Uint32x4  },
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &label_shader,
+                entry_point: "fs_label",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("text_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("text_shader.wgsl").into()),
@@ -591,6 +690,10 @@ impl Renderer {
             text_glyphs_buf,
             text_params_buf,
             text_glyph_count: 0,
+            label_pipeline,
+            label_instance_buf,
+            font_bind_group,
+            n_label_instances: 0,
             color_mode: ColorMode::Depletion,
             show_edges: false,
         }
@@ -636,6 +739,42 @@ impl Renderer {
             screen_h:   self.size.height as f32,
         };
         self.queue.write_buffer(&self.text_params_buf, 0, bytemuck::bytes_of(&params));
+    }
+
+    /// Write label billboard instances. Labels are world-space rectangles that
+    /// always face the camera; text is rendered by the fragment shader.
+    /// Call once after layout is loaded; no need to update per-frame.
+    pub fn update_label_instances(&mut self, labels: &[(Vec3, &str)]) {
+        let half_h = 3.5_f32;  // half-height in world units
+        let instances: Vec<LabelInstance> = labels
+            .iter()
+            .take(MAX_LABEL_INSTANCES as usize)
+            .map(|(pos, text)| {
+                let chars: Vec<u32> = text.chars()
+                    .take(8)
+                    .map(|c| (c as u32).clamp(32, 127))
+                    .collect();
+                let n = chars.len().min(8) as u32;
+                let half_w = n as f32 * half_h;
+                let mut chars01 = [0u32; 4];
+                let mut chars23 = [0u32; 4];
+                for (i, &code) in chars.iter().enumerate() {
+                    if i < 4 { chars01[i] = code; } else { chars23[i - 4] = code; }
+                }
+                LabelInstance {
+                    center_hw: [pos.x, pos.y, pos.z, half_w],
+                    hh_nc:     [half_h, n as f32, 0.0, 0.0],
+                    chars01,
+                    chars23,
+                }
+            })
+            .collect();
+        self.n_label_instances = instances.len() as u32;
+        if !instances.is_empty() {
+            self.queue.write_buffer(
+                &self.label_instance_buf, 0, bytemuck::cast_slice(&instances),
+            );
+        }
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -723,6 +862,14 @@ impl Renderer {
             rpass.set_pipeline(&self.family_pipeline);
             rpass.set_vertex_buffer(0, self.family_instance_bufs[mode_idx].slice(..));
             rpass.draw(0..6, 0..self.family_instance_count);
+
+            // Label billboards — axis labels, drawn in 3D with depth
+            if self.n_label_instances > 0 {
+                rpass.set_pipeline(&self.label_pipeline);
+                rpass.set_bind_group(1, &self.font_bind_group, &[]);
+                rpass.set_vertex_buffer(0, self.label_instance_buf.slice(..));
+                rpass.draw(0..6, 0..self.n_label_instances);
+            }
         }
 
         // Text overlay (second pass — loads 3D scene, no depth)
