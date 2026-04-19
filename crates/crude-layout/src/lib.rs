@@ -38,7 +38,8 @@ pub struct LayoutConfig {
     pub east_scale: f32,
     /// Scale factor mapping material_diff onto the north/south axis.
     pub north_scale: f32,
-    /// Scale factor mapping phase_estimate [0, 1] onto the radial axis.
+    /// Scale factor mapping total pawn count [0, 16] onto the radial axis.
+    /// Default 5.0 gives radial ∈ [0, 80], comparable to east ∈ [4, 78].
     pub radial_scale: f32,
     /// Strength of graph-edge attraction in the force-directed pass.
     pub attraction_strength: f32,
@@ -53,7 +54,7 @@ impl Default for LayoutConfig {
         LayoutConfig {
             east_scale: 1.0,
             north_scale: 2.0,
-            radial_scale: 40.0,
+            radial_scale: 5.0,
             attraction_strength: 0.05,
             repulsion_strength: 0.0,
             iterations: 0,
@@ -64,9 +65,11 @@ impl Default for LayoutConfig {
 /// Compute the crude layout from family records and the transition graph.
 ///
 /// Axis assignment (DESIGN.md §Split rule principles):
-/// - East  = depletion × east_scale  (compositional irreversibility)
-/// - North = material_diff × north_scale  (outcome pull)
-/// - Radial = phase_estimate × radial_scale  (temporal shelling)
+/// - East   = depletion × east_scale   (compositional irreversibility)
+/// - North  = material_diff × north_scale  (outcome pull)
+/// - Radial = (WP + BP) × radial_scale  (total pawn count — genuinely
+///            independent of depletion, unlike phase_estimate which is
+///            depletion/78 and collapses to the east axis)
 ///
 /// An optional force-directed pass applies edge attraction and (if
 /// repulsion_strength > 0) pairwise repulsion.
@@ -85,7 +88,7 @@ pub fn compute(
             Vec3::new(
                 f.depletion * config.east_scale,
                 f.material_diff * config.north_scale,
-                f.phase_estimate * config.radial_scale,
+                (rec.key.wp as f32 + rec.key.bp as f32) * config.radial_scale,
             )
         })
         .collect();
@@ -237,6 +240,34 @@ mod tests {
             assert!(r.is_finite(), "non-finite radial at index {i}: {r}");
             assert!(r >= 0.0, "negative radial at index {i}: {r}");
         }
+    }
+
+    #[test]
+    fn radial_is_independent_of_east() {
+        // Families with the same depletion but different pawn totals must have
+        // different radial coordinates, proving radial is not just a scaled east.
+        // (8,8,8,8): depletion=4, WP+BP=16 → radial = 16 * 5 = 80
+        // (0,0,0,0): depletion=78, WP+BP=0  → radial = 0
+        // (8,8,0,0): depletion=4,  WP+BP=0  → radial = 0  ← same east, different radial
+        let (_, _, table) = setup();
+        let cfg = LayoutConfig::default();
+        let full_pawns = FamilyKey { wnp_band: 8, bnp_band: 8, wp: 8, bp: 8 }.index();
+        let no_pawns   = FamilyKey { wnp_band: 8, bnp_band: 8, wp: 0, bp: 0 }.index();
+        // Same depletion (same east), but full_pawns has radial=80, no_pawns has radial=0
+        let r_full = table.layouts[full_pawns].center.z;
+        let r_none = table.layouts[no_pawns].center.z;
+        assert!(
+            (r_full - 16.0 * cfg.radial_scale).abs() < 1e-4,
+            "full-pawn radial should be 16*radial_scale, got {r_full}"
+        );
+        assert!(
+            r_none.abs() < 1e-4,
+            "no-pawn radial should be 0, got {r_none}"
+        );
+        assert!(
+            r_full > r_none,
+            "same-depletion families with different pawn counts must differ in radial"
+        );
     }
 
     #[test]

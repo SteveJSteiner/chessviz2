@@ -1,4 +1,5 @@
 use bytemuck::{Pod, Zeroable};
+use family_enum::FamilyRecord;
 use family_graph::EdgeType;
 use glam::Mat4;
 use std::sync::Arc;
@@ -7,6 +8,107 @@ use winit::window::Window;
 
 use crate::camera::{projection_matrix, Camera};
 use crude_layout::LayoutTable;
+
+// ── Color modes ───────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorMode {
+    Depletion,       // blue=opening → red=endgame  (east axis driver)
+    MaterialDiff,    // green=white ahead, purple=black ahead, gray=equal
+    PhaseEstimate,   // dark=opening → bright=endgame
+    WnpBand,         // white non-pawn band 0–8
+    BnpBand,         // black non-pawn band 0–8
+    WhitePawns,      // WP 0–8
+    BlackPawns,      // BP 0–8
+}
+
+impl ColorMode {
+    pub const ALL: &'static [ColorMode] = &[
+        ColorMode::Depletion,
+        ColorMode::MaterialDiff,
+        ColorMode::PhaseEstimate,
+        ColorMode::WnpBand,
+        ColorMode::BnpBand,
+        ColorMode::WhitePawns,
+        ColorMode::BlackPawns,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorMode::Depletion     => "depletion (east)",
+            ColorMode::MaterialDiff  => "material diff (north)",
+            ColorMode::PhaseEstimate => "phase estimate (radial)",
+            ColorMode::WnpBand       => "white NP band",
+            ColorMode::BnpBand       => "black NP band",
+            ColorMode::WhitePawns    => "white pawns",
+            ColorMode::BlackPawns    => "black pawns",
+        }
+    }
+
+    pub fn next(self) -> ColorMode {
+        let idx = ColorMode::ALL.iter().position(|&m| m == self).unwrap_or(0);
+        ColorMode::ALL[(idx + 1) % ColorMode::ALL.len()]
+    }
+}
+
+fn lerp_color(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    ]
+}
+
+fn band_color(band: u8) -> [f32; 4] {
+    // 9 bands mapped through a rainbow
+    let t = band as f32 / 8.0;
+    let colors: [[f32; 4]; 3] = [
+        [0.15, 0.15, 0.85, 0.9],   // band 0: deep blue
+        [0.15, 0.85, 0.15, 0.9],   // band 4: green
+        [0.85, 0.15, 0.15, 0.9],   // band 8: red
+    ];
+    if t < 0.5 {
+        lerp_color(colors[0], colors[1], t * 2.0)
+    } else {
+        lerp_color(colors[1], colors[2], (t - 0.5) * 2.0)
+    }
+}
+
+fn pawn_color(pawns: u8) -> [f32; 4] {
+    let t = pawns as f32 / 8.0;
+    lerp_color(
+        [0.85, 0.85, 0.15, 0.9],   // 0 pawns: yellow
+        [0.15, 0.55, 0.85, 0.9],   // 8 pawns: steel blue
+        t,
+    )
+}
+
+fn family_color(rec: &FamilyRecord, mode: ColorMode) -> [f32; 4] {
+    match mode {
+        ColorMode::Depletion => {
+            let t = (rec.features.depletion / 78.0).clamp(0.0, 1.0);
+            lerp_color([0.1, 0.2, 0.9, 0.9], [0.9, 0.1, 0.1, 0.9], t)
+        }
+        ColorMode::MaterialDiff => {
+            // diff in [-29, 29], neutral = 0
+            let t = (rec.features.material_diff / 29.0).clamp(-1.0, 1.0);
+            if t >= 0.0 {
+                lerp_color([0.5, 0.5, 0.5, 0.9], [0.1, 0.85, 0.3, 0.9], t)
+            } else {
+                lerp_color([0.5, 0.5, 0.5, 0.9], [0.7, 0.1, 0.8, 0.9], -t)
+            }
+        }
+        ColorMode::PhaseEstimate => {
+            let t = rec.features.phase_estimate.clamp(0.0, 1.0);
+            lerp_color([0.1, 0.1, 0.2, 0.9], [0.95, 0.95, 0.95, 0.9], t)
+        }
+        ColorMode::WnpBand => band_color(rec.key.wnp_band),
+        ColorMode::BnpBand => band_color(rec.key.bnp_band),
+        ColorMode::WhitePawns => pawn_color(rec.key.wp),
+        ColorMode::BlackPawns => pawn_color(rec.key.bp),
+    }
+}
 
 // ── GPU types ─────────────────────────────────────────────────────────────────
 
@@ -23,7 +125,7 @@ struct CameraUniforms {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct FamilyInstance {
-    pub center_size: [f32; 4], // xyz=center, w=half_size
+    pub center_size: [f32; 4],
     pub color: [f32; 4],
 }
 
@@ -47,19 +149,29 @@ pub struct Renderer {
     camera_bind_group: wgpu::BindGroup,
 
     family_pipeline: wgpu::RenderPipeline,
-    family_instance_buf: wgpu::Buffer,
+    // One instance buffer per color mode, indexed by ColorMode::ALL position.
+    family_instance_bufs: Vec<wgpu::Buffer>,
     family_instance_count: u32,
 
     edge_pipeline: wgpu::RenderPipeline,
     edge_vertex_buf: wgpu::Buffer,
     edge_vertex_count: u32,
+    axis_vertex_buf: wgpu::Buffer,
 
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+
+    pub color_mode: ColorMode,
+    pub show_edges: bool,
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, layout: &LayoutTable, edge_verts: Vec<EdgeVertex>) -> Self {
+    pub async fn new(
+        window: Arc<Window>,
+        layout: &LayoutTable,
+        families: &[FamilyRecord],
+        edge_verts: Vec<EdgeVertex>,
+    ) -> Self {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -258,32 +370,56 @@ impl Renderer {
             cache: None,
         });
 
-        // ── Family instance buffer ──────────────────────────────────────────
-        let family_instances: Vec<FamilyInstance> = layout
-            .layouts
+        // ── Family instance buffers — one per color mode ────────────────────
+        let family_instance_count = layout.layouts.len() as u32;
+        let family_instance_bufs: Vec<wgpu::Buffer> = ColorMode::ALL
             .iter()
-            .enumerate()
-            .map(|(_, fl)| {
-                let c = fl.center;
-                let size = fl.extent_budget.he.max(0.3);
-                let t = (c.x / 78.0).clamp(0.0, 1.0); // east = depletion proxy
-                let color = [
-                    0.2 + 0.6 * t,
-                    0.3 * (1.0 - t),
-                    0.8 * (1.0 - t) + 0.1,
-                    0.85,
-                ];
-                FamilyInstance {
-                    center_size: [c.x, c.y, c.z, size],
-                    color,
-                }
+            .map(|&mode| {
+                let instances: Vec<FamilyInstance> = layout
+                    .layouts
+                    .iter()
+                    .zip(families.iter())
+                    .map(|(fl, rec)| {
+                        let c = fl.center;
+                        let size = fl.extent_budget.he * 1.5;
+                        FamilyInstance {
+                            center_size: [c.x, c.y, c.z, size],
+                            color: family_color(rec, mode),
+                        }
+                    })
+                    .collect();
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("family_instances"),
+                    contents: bytemuck::cast_slice(&instances),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
             })
             .collect();
 
-        let family_instance_count = family_instances.len() as u32;
-        let family_instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("family_instances"),
-            contents: bytemuck::cast_slice(&family_instances),
+        // ── Axis lines ──────────────────────────────────────────────────────
+        // Three lines through the cloud centroid (40, 0, 40), extending beyond
+        // the cloud bounds so they frame the space.
+        // Red   = east  (x, depletion — more depleted → more east)
+        // Green = north (y, material_diff — white ahead → north)
+        // Blue  = radial (z, pawn count — more pawns → deeper in)
+        let cx = 40.0_f32;
+        let cy = 0.0_f32;
+        let cz = 40.0_f32;
+        let ext = 70.0_f32; // extension beyond centroid in each direction
+        let red   = [1.0_f32, 0.25, 0.25, 1.0];
+        let green = [0.25_f32, 1.0, 0.35, 1.0];
+        let blue  = [0.35_f32, 0.55, 1.0, 1.0];
+        let axis_verts: &[EdgeVertex] = &[
+            EdgeVertex { pos: [cx - ext, cy, cz], color: red   },
+            EdgeVertex { pos: [cx + ext, cy, cz], color: red   },
+            EdgeVertex { pos: [cx, cy - ext, cz], color: green },
+            EdgeVertex { pos: [cx, cy + ext, cz], color: green },
+            EdgeVertex { pos: [cx, cy, cz - ext], color: blue  },
+            EdgeVertex { pos: [cx, cy, cz + ext], color: blue  },
+        ];
+        let axis_vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("axis"),
+            contents: bytemuck::cast_slice(axis_verts),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
@@ -308,13 +444,16 @@ impl Renderer {
             camera_buf,
             camera_bind_group,
             family_pipeline,
-            family_instance_buf,
+            family_instance_bufs,
             family_instance_count,
             edge_pipeline,
+            axis_vertex_buf,
             edge_vertex_buf,
             edge_vertex_count,
             depth_texture,
             depth_view,
+            color_mode: ColorMode::Depletion,
+            show_edges: false,
         }
     }
 
@@ -334,15 +473,12 @@ impl Renderer {
     pub fn update_camera(&self, cam: &Camera) {
         let aspect = self.size.width as f32 / self.size.height as f32;
         let proj = projection_matrix(std::f32::consts::FRAC_PI_3, aspect, 0.1, 2000.0);
-        let view = cam.view_matrix();
-        let vp: Mat4 = proj * view;
-        let right = cam.right();
-        let up = cam.up();
+        let vp: Mat4 = proj * cam.view_matrix();
         let uniforms = CameraUniforms {
             view_proj: vp.to_cols_array_2d(),
-            right: right.to_array(),
+            right: cam.right().to_array(),
             _p0: 0.0,
-            up: up.to_array(),
+            up: cam.up().to_array(),
             _p1: 0.0,
         };
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&uniforms));
@@ -384,15 +520,27 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
-            // Draw edges first (behind glyphs)
-            rpass.set_pipeline(&self.edge_pipeline);
             rpass.set_bind_group(0, &self.camera_bind_group, &[]);
-            rpass.set_vertex_buffer(0, self.edge_vertex_buf.slice(..));
-            rpass.draw(0..self.edge_vertex_count, 0..1);
 
-            // Draw family billboards on top
+            // Axis lines (always on)
+            rpass.set_pipeline(&self.edge_pipeline);
+            rpass.set_vertex_buffer(0, self.axis_vertex_buf.slice(..));
+            rpass.draw(0..6, 0..1);
+
+            // Family edges (optional, 'B' to toggle)
+            if self.show_edges {
+                rpass.set_pipeline(&self.edge_pipeline);
+                rpass.set_vertex_buffer(0, self.edge_vertex_buf.slice(..));
+                rpass.draw(0..self.edge_vertex_count, 0..1);
+            }
+
+            // Family glyphs — active color mode buffer
+            let mode_idx = ColorMode::ALL
+                .iter()
+                .position(|&m| m == self.color_mode)
+                .unwrap_or(0);
             rpass.set_pipeline(&self.family_pipeline);
-            rpass.set_vertex_buffer(0, self.family_instance_buf.slice(..));
+            rpass.set_vertex_buffer(0, self.family_instance_bufs[mode_idx].slice(..));
             rpass.draw(0..6, 0..self.family_instance_count);
         }
 
@@ -426,17 +574,16 @@ fn make_depth_texture(
 
 pub fn dominant_edge_color(edge_types: &[EdgeType]) -> [f32; 4] {
     use EdgeType::*;
-    // Pick the type with the highest v0 weight as the display representative
     let dominant = edge_types
         .iter()
         .max_by(|a, b| a.v0_weight().partial_cmp(&b.v0_weight()).unwrap())
         .copied()
         .unwrap_or(EdgeType::E);
     match dominant {
-        D => [0.9, 0.55, 0.15, 0.35],
-        BMinor => [0.15, 0.85, 0.85, 0.30],
-        BMajor => [0.85, 0.85, 0.15, 0.30],
-        C => [0.15, 0.85, 0.35, 0.25],
-        E | FWithBMinor | FWithBMajor | FWithC => [0.65, 0.15, 0.85, 0.20],
+        D => [0.9, 0.55, 0.15, 0.25],
+        BMinor => [0.15, 0.85, 0.85, 0.20],
+        BMajor => [0.85, 0.85, 0.15, 0.20],
+        C => [0.15, 0.85, 0.35, 0.15],
+        E | FWithBMinor | FWithBMajor | FWithC => [0.65, 0.15, 0.85, 0.12],
     }
 }
