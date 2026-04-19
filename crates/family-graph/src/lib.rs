@@ -69,6 +69,42 @@ impl EdgeMeta {
 /// Node weight: `FamilyKey`. Edge weight: `EdgeMeta`.
 pub type FamilyGraph = Graph<FamilyKey, EdgeMeta, Undirected>;
 
+/// Project-owned serialization artifact for the family transition graph.
+///
+/// Stores the graph as a plain adjacency list rather than serializing
+/// `petgraph::Graph` internals directly, so the on-disk format is stable
+/// across petgraph version changes and owned by this project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphArtifact {
+    /// Number of nodes (always 6561 for the family graph).
+    pub node_count: usize,
+    /// Edges as (node_a_index, node_b_index, metadata).
+    pub edges: Vec<(usize, usize, EdgeMeta)>,
+}
+
+impl GraphArtifact {
+    pub fn from_graph(graph: &FamilyGraph) -> Self {
+        let edges = graph
+            .edge_indices()
+            .map(|e| {
+                let (a, b) = graph.edge_endpoints(e).unwrap();
+                (a.index(), b.index(), graph.edge_weight(e).unwrap().clone())
+            })
+            .collect();
+        GraphArtifact { node_count: graph.node_count(), edges }
+    }
+
+    pub fn to_graph(&self, families: &[family_enum::FamilyRecord]) -> FamilyGraph {
+        let mut graph: FamilyGraph = Graph::new_undirected();
+        let nodes: Vec<NodeIndex> =
+            families.iter().map(|rec| graph.add_node(rec.key)).collect();
+        for (a, b, meta) in &self.edges {
+            graph.add_edge(nodes[*a], nodes[*b], meta.clone());
+        }
+        graph
+    }
+}
+
 // ── Band reachability helpers ─────────────────────────────────────────────────
 
 /// True if removing `pv` points from some value in band `from` can land in band `to`.
@@ -120,7 +156,17 @@ fn can_promote_to(from: usize, to: usize) -> bool {
 // ── Graph construction ────────────────────────────────────────────────────────
 
 /// Enumerate all family edges by the coarse-delta rules and build the graph.
-/// See DESIGN.md §Graph semantics and §Edge taxonomy.
+///
+/// **This graph is a coarse material-delta scaffold, not a certified move
+/// witness.** An edge between F1 and F2 records that the family keys differ
+/// by a one-move material delta — some conceivable single-ply move *could*
+/// connect some position in F1 to some position in F2. Many edges have no
+/// reachable game witness at any position in F1. That is intentional and
+/// correct: the graph is permissive by design (DESIGN.md §Graph semantics).
+///
+/// Multiple coarse-delta reasons for the same pair are aggregated onto a
+/// single structural edge; `layout_weight` is the max across contributing
+/// types, not their sum (DESIGN.md §Storage).
 pub fn build_graph(families: &[FamilyRecord]) -> FamilyGraph {
     // Accumulate edge types per unordered pair (min_idx, max_idx).
     let mut edge_map: HashMap<(usize, usize), Vec<EdgeType>> = HashMap::new();
@@ -319,6 +365,7 @@ pub fn build_graph(families: &[FamilyRecord]) -> FamilyGraph {
 mod tests {
     use super::*;
     use family_enum::{build_table, FamilyKey};
+    use petgraph::visit::EdgeRef;
 
     fn build_test_graph() -> FamilyGraph {
         let families = build_table();
@@ -357,33 +404,54 @@ mod tests {
         }
     }
 
+    /// Documents the permissive semantics: an edge exists as coarse potential
+    /// even when the specific starting-position game state cannot produce that
+    /// move in one ply. The graph is a material-delta scaffold, not a certified
+    /// move witness (DESIGN.md §Graph semantics).
     #[test]
-    fn starting_family_has_bminor_edge() {
-        // Starting family (8,8,8,8) should connect to (7,8,8,8):
-        // removing a minor (value 3) from band 8 [27-31] → [24-28] overlaps band 7 [21-26].
+    fn graph_is_coarse_potential_not_certified() {
+        // (8,8,8,8)→(7,8,8,8) is in the graph: removing a minor from band 8 can
+        // reach band 7. However, the actual chess starting position (also in
+        // family (8,8,8,8)) cannot execute any minor-capturing move on move 1 —
+        // all pieces are blocked by pawns. The edge records potential, not
+        // certification. This is correct by design.
         let g = build_test_graph();
         let start = FamilyKey { wnp_band: 8, bnp_band: 8, wp: 8, bp: 8 };
         let neighbor = FamilyKey { wnp_band: 7, bnp_band: 8, wp: 8, bp: 8 };
-        let meta = get_edge(&g, start, neighbor)
-            .expect("expected BMinor edge from starting family to (7,8,8,8)");
         assert!(
-            meta.edge_types.contains(&EdgeType::BMinor),
-            "edge missing BMinor type; got {:?}",
-            meta.edge_types
+            get_edge(&g, start, neighbor).is_some(),
+            "coarse-potential edge (8,8,8,8)→(7,8,8,8) should exist even without a game witness"
         );
     }
 
+    /// Multiple coarse-delta reasons for the same pair must collapse to exactly
+    /// one structural edge; all contributing types are preserved in the metadata.
     #[test]
-    fn pawn_capture_edge_has_c_and_d_with_correct_weight() {
-        // (8,8,8,8) → (8,8,8,7): white captures black's pawn.
-        // C applies (w=8 > 0 non-pawn), D applies (wp=8 > 0 pawn).
-        // layout_weight = max(0.08, 0.35) = 0.35.
+    fn multiple_reasons_collapse_to_one_structural_edge() {
+        // (8,8,8,8)-(8,8,8,7): white captures black's pawn.
+        // Reason C: white non-pawn captures pawn (w=8>0, bp=8>0).
+        // Reason D: white pawn captures pawn (wp=8>0, bp=8>0).
+        // These must collapse to a single structural edge, not two.
         let g = build_test_graph();
         let f1 = FamilyKey { wnp_band: 8, bnp_band: 8, wp: 8, bp: 8 };
         let f2 = FamilyKey { wnp_band: 8, bnp_band: 8, wp: 8, bp: 7 };
-        let meta = get_edge(&g, f1, f2).expect("expected C/D edge");
+        let n1 = node(f1);
+        let n2 = node(f2);
+        // Count structural edges between the two nodes
+        let count = g
+            .edge_references()
+            .filter(|e| {
+                (e.source() == n1 && e.target() == n2)
+                    || (e.source() == n2 && e.target() == n1)
+            })
+            .count();
+        assert_eq!(count, 1, "expected exactly 1 structural edge, found {count}");
+        // Metadata must carry both contributing types
+        let meta = get_edge(&g, f1, f2).unwrap();
+        assert_eq!(meta.edge_types.len(), 2, "expected 2 contributing types, got {:?}", meta.edge_types);
         assert!(meta.edge_types.contains(&EdgeType::C), "missing C");
         assert!(meta.edge_types.contains(&EdgeType::D), "missing D");
+        // layout_weight = max(C=0.08, D=0.35) = 0.35
         assert!(
             (meta.layout_weight - 0.35).abs() < 1e-6,
             "expected weight 0.35, got {}",
@@ -391,23 +459,27 @@ mod tests {
         );
     }
 
+    /// `layout_weight` is the max of contributing type weights, not their sum,
+    /// and is independent of the order types are inserted.
     #[test]
-    fn weight_aggregation_uses_max() {
-        // (5,5,4,4) → (4,5,4,4): white's NP band drops from 5 to 4.
-        // Band 5 [12-15] minus 3 → [9-12] overlaps band 4 [9-11]: BMinor (0.30).
-        // Band 5 [12-15] minus 5 → [7-10] overlaps band 4 [9-11]: BMajor (0.10).
-        // layout_weight = max(0.30, 0.10) = 0.30.
+    fn weight_aggregation_is_max_and_order_independent() {
+        // Unit test on EdgeMeta::from_types directly.
+        let types_ab = vec![EdgeType::BMinor, EdgeType::BMajor];
+        let types_ba = vec![EdgeType::BMajor, EdgeType::BMinor];
+        let meta_ab = EdgeMeta::from_types(types_ab);
+        let meta_ba = EdgeMeta::from_types(types_ba);
+        // max(BMinor=0.30, BMajor=0.10) = 0.30 regardless of order
+        assert!((meta_ab.layout_weight - 0.30).abs() < 1e-6, "ab weight wrong: {}", meta_ab.layout_weight);
+        assert!((meta_ba.layout_weight - 0.30).abs() < 1e-6, "ba weight wrong: {}", meta_ba.layout_weight);
+
+        // Also verify in the graph: (5,5,4,4)-(4,5,4,4) has both BMinor and BMajor.
         let g = build_test_graph();
         let f1 = FamilyKey { wnp_band: 5, bnp_band: 5, wp: 4, bp: 4 };
         let f2 = FamilyKey { wnp_band: 4, bnp_band: 5, wp: 4, bp: 4 };
         let meta = get_edge(&g, f1, f2).expect("expected BMinor+BMajor edge");
-        assert!(meta.edge_types.contains(&EdgeType::BMinor), "missing BMinor");
-        assert!(meta.edge_types.contains(&EdgeType::BMajor), "missing BMajor");
-        assert!(
-            (meta.layout_weight - 0.30).abs() < 1e-6,
-            "expected weight 0.30, got {}",
-            meta.layout_weight
-        );
+        assert!(meta.edge_types.contains(&EdgeType::BMinor));
+        assert!(meta.edge_types.contains(&EdgeType::BMajor));
+        assert!((meta.layout_weight - 0.30).abs() < 1e-6, "graph edge weight wrong: {}", meta.layout_weight);
     }
 
     #[test]
@@ -430,5 +502,15 @@ mod tests {
     fn node_count_is_6561() {
         let g = build_test_graph();
         assert_eq!(g.node_count(), 6561);
+    }
+
+    #[test]
+    fn graph_artifact_roundtrips() {
+        let families = build_table();
+        let g = build_graph(&families);
+        let artifact = GraphArtifact::from_graph(&g);
+        let g2 = artifact.to_graph(&families);
+        assert_eq!(g.node_count(), g2.node_count());
+        assert_eq!(g.edge_count(), g2.edge_count());
     }
 }

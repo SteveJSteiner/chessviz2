@@ -11,7 +11,11 @@ use serde::{Deserialize, Serialize};
 use shakmaty::{Chess, Color, Square};
 
 /// Opaque combinadic rank identifying a non-pawn piece placement.
-pub type PlacementAddress = u64;
+///
+/// Mixed-radix combinadics over the free-square set. With up to 9 queens
+/// per side (after 8 promotions), the rank space can exceed 2^64 — u128
+/// is required. See DESIGN.md §Placement address.
+pub type PlacementAddress = u128;
 
 /// The context required to interpret a `PlacementAddress`.
 ///
