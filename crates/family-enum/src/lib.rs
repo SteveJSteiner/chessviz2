@@ -84,6 +84,111 @@ impl FamilyKey {
     }
 }
 
+/// Per-band statistics over the starting-limit NP composition enumeration.
+/// Family-layer composition priors — not exact-composition truth, which is
+/// promotion-aware and finer.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BandCompositionStats {
+    /// P(queen present) over starting-limit compositions in this band.
+    pub q: f32,
+    /// E[rook count] over starting-limit compositions in this band.
+    pub r: f32,
+    /// P(rookless and ≥2 minors) over starting-limit compositions.
+    pub m: f32,
+}
+
+/// Precompute per-band composition stats for all 9 bands.
+pub fn band_composition_stats() -> [BandCompositionStats; 9] {
+    std::array::from_fn(|band_idx| {
+        let b = &BAND_TABLE[band_idx];
+        let mut count = 0u32;
+        let mut q_count = 0u32;
+        let mut r_sum = 0u32;
+        let mut m_count = 0u32;
+        for wq in 0u8..=1 {
+            for wr in 0u8..=2 {
+                for wb in 0u8..=2 {
+                    for wn in 0u8..=2 {
+                        let v = 9 * wq + 5 * wr + 3 * wb + 3 * wn;
+                        if v < b.lo || v > b.hi { continue; }
+                        count += 1;
+                        if wq >= 1 { q_count += 1; }
+                        r_sum += wr as u32;
+                        if wr == 0 && (wn + wb) >= 2 { m_count += 1; }
+                    }
+                }
+            }
+        }
+        let n = count as f32;
+        BandCompositionStats {
+            q: if n > 0.0 { q_count as f32 / n } else { 0.0 },
+            r: if n > 0.0 { r_sum as f32 / n } else { 0.0 },
+            m: if n > 0.0 { m_count as f32 / n } else { 0.0 },
+        }
+    })
+}
+
+/// Family-layer composition prior feature vector φ(F).
+/// Symmetric (+) and antisymmetric (−) channels over per-band stats.
+/// "Prior" because it uses band-level approximations, not the promotion-aware
+/// exact-composition layer.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FamilyModeFeatures {
+    pub q_plus: f32,         // q(wb) + q(bb)
+    pub q_minus: f32,        // q(wb) - q(bb)
+    pub r_plus: f32,         // r(wb) + r(bb)
+    pub r_minus: f32,        // r(wb) - r(bb)
+    pub m_plus: f32,         // m(wb) + m(bb)
+    pub m_minus: f32,        // m(wb) - m(bb)
+    pub pawn_density: f32,   // (wp + bp) / 16
+    pub pawn_imbalance: f32, // (wp - bp) / 8
+}
+
+impl FamilyModeFeatures {
+    pub fn as_array(&self) -> [f32; 8] {
+        [self.q_plus, self.q_minus, self.r_plus, self.r_minus,
+         self.m_plus, self.m_minus, self.pawn_density, self.pawn_imbalance]
+    }
+}
+
+/// Minimum non-pawn pieces that must have been removed from the starting 7
+/// (Q, R, R, B, B, N, N) to land in each NP band, computed greedily by
+/// removing the highest-value piece first.
+///
+/// Indexed by band index 0..=8. Both sides share the same table (symmetric).
+pub const WNP_MIN_PIECES_REMOVED: [u32; 9] = [
+    7, // band 0 [0]:     all 7 removed
+    6, // band 1 [1–3]:   leave 1 N or B
+    6, // band 2 [4–5]:   leave 1 R (no 2-piece combo ≤ 5)
+    5, // band 3 [6–8]:   leave N+N / N+B / B+B
+    4, // band 4 [9–11]:  leave B+N+N / etc.
+    3, // band 5 [12–15]: leave R+B+B / etc.
+    2, // band 6 [16–20]: leave R+R+B+B / etc.
+    1, // band 7 [21–26]: leave all but Q (→ 22)
+    0, // band 8 [27–31]: full starting set
+];
+
+/// Count of distinct starting-limit NP piece-count tuples (wn,wb,wr,wq)
+/// with wn,wb,wr ∈ 0..=2, wq ∈ 0..=1 whose value (3wn+3wb+5wr+9wq)
+/// falls in the band's [lo, hi] range.
+fn wnp_band_composition_count(band_idx: u8) -> u32 {
+    let b = &BAND_TABLE[band_idx as usize];
+    let mut n = 0u32;
+    for wq in 0u8..=1 {
+        for wr in 0u8..=2 {
+            for wb in 0u8..=2 {
+                for wn in 0u8..=2 {
+                    let v = 9 * wq + 5 * wr + 3 * wb + 3 * wn;
+                    if v >= b.lo && v <= b.hi {
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
 /// Derived scalar features for a family, computed from the key + [`BAND_TABLE`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FamilyFeatures {
@@ -103,13 +208,24 @@ pub struct FamilyFeatures {
     /// Semantic width of the wider NP band (max of wnp span, bnp span).
     /// Drives anisotropic extent budget in crude-layout.
     pub feature_span: f32,
+    /// Coarse prior on family occupancy: product of the counts of starting-limit
+    /// NP piece-count tuples that fall in each side's band. Excludes promotions.
+    /// Named "prior" because it undercounts promoted-piece compositions.
+    pub family_mass_prior: u32,
+    /// Lower bound on the minimum number of capture plies needed to reach this
+    /// family from the starting position. Based on piece counts lost, not point
+    /// values — one capture ply removes exactly one piece regardless of its value.
+    /// = WNP_MIN_PIECES_REMOVED[wnp_band] + WNP_MIN_PIECES_REMOVED[bnp_band]
+    ///   + (8 − wp) + (8 − bp). Returns 0 for the starting family.
+    pub min_capture_bound: u32,
 }
 
-/// One row in the family table: key + derived features.
+/// One row in the family table: key + derived features + composition prior.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FamilyRecord {
     pub key: FamilyKey,
     pub features: FamilyFeatures,
+    pub mode: FamilyModeFeatures,
 }
 
 /// Build the complete 6561-entry family table.
@@ -118,6 +234,10 @@ pub struct FamilyRecord {
 /// gives the record for `key`. All feature computation is pure arithmetic
 /// over `BAND_TABLE`; no IO, no randomness.
 pub fn build_table() -> Vec<FamilyRecord> {
+    let comp_counts: [u32; 9] =
+        std::array::from_fn(|i| wnp_band_composition_count(i as u8));
+    let band_stats = band_composition_stats();
+
     let mut records = Vec::with_capacity(6561);
     for wnp_band in 0u8..9 {
         for bnp_band in 0u8..9 {
@@ -126,9 +246,11 @@ pub fn build_table() -> Vec<FamilyRecord> {
                     let key = FamilyKey { wnp_band, bnp_band, wp, bp };
                     let wb = &BAND_TABLE[wnp_band as usize];
                     let bb = &BAND_TABLE[bnp_band as usize];
+                    let ws = &band_stats[wnp_band as usize];
+                    let bs = &band_stats[bnp_band as usize];
 
-                    let wnp_center    = wb.center;
-                    let bnp_center    = bb.center;
+                    let wnp_center     = wb.center;
+                    let bnp_center     = bb.center;
                     let total_material = wnp_center + bnp_center + wp as f32 + bp as f32;
                     let material_diff  = wnp_center - bnp_center;
                     let depletion      = (31.0 - wnp_center)
@@ -137,6 +259,24 @@ pub fn build_table() -> Vec<FamilyRecord> {
                                        + (8.0  - bp as f32);
                     let phase_estimate = depletion / 78.0;
                     let feature_span   = wb.span.max(bb.span) as f32;
+                    let family_mass_prior =
+                        comp_counts[wnp_band as usize] * comp_counts[bnp_band as usize];
+                    let min_capture_bound =
+                        WNP_MIN_PIECES_REMOVED[wnp_band as usize]
+                        + WNP_MIN_PIECES_REMOVED[bnp_band as usize]
+                        + (8 - wp) as u32
+                        + (8 - bp) as u32;
+
+                    let mode = FamilyModeFeatures {
+                        q_plus:         ws.q + bs.q,
+                        q_minus:        ws.q - bs.q,
+                        r_plus:         ws.r + bs.r,
+                        r_minus:        ws.r - bs.r,
+                        m_plus:         ws.m + bs.m,
+                        m_minus:        ws.m - bs.m,
+                        pawn_density:   (wp as f32 + bp as f32) / 16.0,
+                        pawn_imbalance: (wp as f32 - bp as f32) / 8.0,
+                    };
 
                     records.push(FamilyRecord {
                         key,
@@ -148,7 +288,10 @@ pub fn build_table() -> Vec<FamilyRecord> {
                             phase_estimate,
                             depletion,
                             feature_span,
+                            family_mass_prior,
+                            min_capture_bound,
                         },
+                        mode,
                     });
                 }
             }
@@ -315,6 +458,97 @@ mod tests {
         // Equal: material_diff = 0
         let equal = table[FamilyKey { wnp_band: 5, bnp_band: 5, wp: 4, bp: 4 }.index()];
         assert!((equal.features.material_diff).abs() < 1e-6);
+    }
+
+    #[test]
+    fn family_mass_prior_starting_family_is_nine() {
+        let table = build_table();
+        // Band 8 [27,31] has 3 NP compositions from starting limits:
+        //   (wn=2,wb=2,wr=2,wq=1)=31, (wn=1,wb=2,wr=2,wq=1)=28, (wn=2,wb=1,wr=2,wq=1)=28
+        // mass_prior = 3 * 3 = 9 (both sides symmetric).
+        let rec = table[FamilyKey { wnp_band: 8, bnp_band: 8, wp: 8, bp: 8 }.index()];
+        assert_eq!(rec.features.family_mass_prior, 9,
+            "starting family should have mass_prior=9, got {}", rec.features.family_mass_prior);
+    }
+
+    #[test]
+    fn family_mass_prior_bare_family_is_one() {
+        let table = build_table();
+        // Bare family (wnp_band=0, bnp_band=0, wp=0, bp=0):
+        // Only one NP composition in band 0: the empty set (0,0,0,0).
+        let rec = table[FamilyKey { wnp_band: 0, bnp_band: 0, wp: 0, bp: 0 }.index()];
+        assert_eq!(rec.features.family_mass_prior, 1);
+    }
+
+    #[test]
+    fn family_mass_prior_is_nonzero_for_all_families() {
+        let table = build_table();
+        for rec in &table {
+            assert!(rec.features.family_mass_prior > 0,
+                "family_mass_prior is 0 for {:?}", rec.key);
+        }
+    }
+
+    #[test]
+    fn family_mass_prior_peaks_at_middle_bands() {
+        let table = build_table();
+        // Middle bands (4-6) have more compositions than extremes (0,8).
+        let mid = table[FamilyKey { wnp_band: 5, bnp_band: 5, wp: 4, bp: 4 }.index()];
+        let start = table[FamilyKey { wnp_band: 8, bnp_band: 8, wp: 8, bp: 8 }.index()];
+        let bare = table[FamilyKey { wnp_band: 0, bnp_band: 0, wp: 0, bp: 0 }.index()];
+        assert!(mid.features.family_mass_prior > start.features.family_mass_prior);
+        assert!(mid.features.family_mass_prior > bare.features.family_mass_prior);
+    }
+
+    #[test]
+    fn min_capture_bound_starting_family_is_zero() {
+        let table = build_table();
+        let rec = table[FamilyKey { wnp_band: 8, bnp_band: 8, wp: 8, bp: 8 }.index()];
+        assert_eq!(rec.features.min_capture_bound, 0,
+            "starting family reachable at ply 0, got {}", rec.features.min_capture_bound);
+    }
+
+    #[test]
+    fn min_capture_bound_bare_family_is_30() {
+        let table = build_table();
+        // All 7+7 NP pieces plus 8+8 pawns must be captured: 30 total.
+        let rec = table[FamilyKey { wnp_band: 0, bnp_band: 0, wp: 0, bp: 0 }.index()];
+        assert_eq!(rec.features.min_capture_bound, 30,
+            "bare family needs 30 captures, got {}", rec.features.min_capture_bound);
+    }
+
+    #[test]
+    fn min_capture_bound_increases_with_depletion() {
+        let table = build_table();
+        // Losing white's queen (band 8→7) must increase min_capture_bound by 1.
+        let f8 = table[FamilyKey { wnp_band: 8, bnp_band: 8, wp: 8, bp: 8 }.index()];
+        let f7 = table[FamilyKey { wnp_band: 7, bnp_band: 8, wp: 8, bp: 8 }.index()];
+        assert_eq!(f7.features.min_capture_bound, f8.features.min_capture_bound + 1);
+        // Losing a pawn also costs exactly 1 capture ply.
+        let fp = table[FamilyKey { wnp_band: 8, bnp_band: 8, wp: 7, bp: 8 }.index()];
+        assert_eq!(fp.features.min_capture_bound, f8.features.min_capture_bound + 1);
+    }
+
+    #[test]
+    fn wnp_composition_counts_match_expected() {
+        // Verify the per-band counts against the manually-derived table.
+        let expected: [u32; 9] = {
+            let mut e = [0u32; 9];
+            for i in 0..9 { e[i] = wnp_band_composition_count(i as u8); }
+            e
+        };
+        // Band 0: only (0,0,0,0) → 1
+        assert_eq!(expected[0], 1);
+        // Band 1: 1N, 1B → 2
+        assert_eq!(expected[1], 2);
+        // Band 2: 1R → 1
+        assert_eq!(expected[2], 1);
+        // Band 8 [27,31]: (2,2,2,1)=31, (1,2,2,1)=28, (2,1,2,1)=28 → 3
+        assert_eq!(expected[8], 3);
+        // All must be nonzero
+        for (i, &c) in expected.iter().enumerate() {
+            assert!(c > 0, "band {i} has 0 compositions");
+        }
     }
 
     #[test]

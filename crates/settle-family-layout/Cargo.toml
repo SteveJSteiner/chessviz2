@@ -1,0 +1,16 @@
+[package]
+name    = "settle-family-layout"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "settle-family-layout"
+path = "src/main.rs"
+
+[dependencies]
+family-enum  = { workspace = true }
+family-graph = { workspace = true }
+crude-layout = { workspace = true }
+glam         = { workspace = true }
+bincode      = { workspace = true }
+serde        = { workspace = true }

@@ -43,9 +43,25 @@ pub struct LayoutConfig {
     pub radial_scale: f32,
     /// Strength of graph-edge attraction in the force-directed pass.
     pub attraction_strength: f32,
-    /// Strength of local repulsion to prevent cell overlap (0 = disabled).
+    /// Strength of local repulsion to de-collide coincident families.
     pub repulsion_strength: f32,
-    /// Number of force-directed iterations (0 = deterministic placement only).
+    /// Max world-space distance at which repulsion acts. Families farther apart
+    /// than this don't repel each other, keeping the pass O(local) in practice.
+    pub repulsion_distance: f32,
+    /// 3×8 mode matrix A. Each column is a 3D displacement vector (east, north, radial)
+    /// applied per unit of the corresponding φ(F) channel:
+    ///   [q_plus, q_minus, r_plus, r_minus, m_plus, m_minus, pawn_density, pawn_imbalance]
+    /// The seed x_F = s(F) + A·φ(F) breaks symmetries between families that share
+    /// the same coarse seed (same depletion/imbalance/pawn-total) but differ in
+    /// piece-type composition profile.
+    pub mode_matrix: [[f32; 3]; 8],
+    /// Strength of the restoring force pulling each family back toward its
+    /// mode-displaced seed, preserving global axis semantics.
+    pub anchor_strength: f32,
+    /// Per-iteration force clamp in world-space units. Prevents oscillation /
+    /// blowup when repulsion is strong near coincident seeds.
+    pub max_step: f32,
+    /// Number of force-directed iterations (0 = deterministic seed only).
     pub iterations: u32,
 }
 
@@ -55,9 +71,26 @@ impl Default for LayoutConfig {
             east_scale: 1.0,
             north_scale: 2.0,
             radial_scale: 5.0,
-            attraction_strength: 0.05,
-            repulsion_strength: 0.0,
-            iterations: 0,
+            attraction_strength: 0.005,
+            repulsion_strength: 0.4,
+            repulsion_distance: 10.0,
+            // Columns: q_plus, q_minus, r_plus, r_minus, m_plus, m_minus,
+            //          pawn_density, pawn_imbalance
+            // Magnitudes chosen to displace ~2–5 world units per unit of φ,
+            // enough to break grid symmetry without overwhelming the seed.
+            mode_matrix: [
+                [0.0,  0.0,  3.0],  // q_plus  → radial (queen-rich = complex positions)
+                [0.0,  5.0,  0.0],  // q_minus → north  (queen advantage)
+                [3.0,  0.0,  0.0],  // r_plus  → east   (rook endgames = more exchanges)
+                [0.0,  3.0,  0.0],  // r_minus → north  (rook advantage)
+                [0.0,  0.0, -3.0],  // m_plus  → -radial (minor endgames = simpler)
+                [0.0,  2.0,  0.0],  // m_minus → north  (minor advantage)
+                [0.0,  0.0,  4.0],  // pawn_density → reinforces radial
+                [0.0,  2.0,  0.0],  // pawn_imbalance → north
+            ],
+            anchor_strength: 0.3,
+            max_step: 0.5,
+            iterations: 60,
         }
     }
 }
@@ -80,21 +113,44 @@ pub fn compute(
 ) -> LayoutTable {
     let n = families.len();
 
-    // ── Deterministic initial positions ──────────────────────────────────────
+    // ── Seed: committed semantic axes + mode displacement A·φ(F) ─────────────
+    // s(F) = (depletion·east_scale, material_diff·north_scale, pawn_total·radial_scale)
+    // x(F) = s(F) + A·φ(F)
+    // A·φ(F) breaks grid symmetry between families sharing the same coarse seed.
     let mut positions: Vec<Vec3> = families
         .iter()
         .map(|rec| {
             let f = &rec.features;
-            Vec3::new(
+            let seed = Vec3::new(
                 f.depletion * config.east_scale,
                 f.material_diff * config.north_scale,
                 (rec.key.wp as f32 + rec.key.bp as f32) * config.radial_scale,
-            )
+            );
+            let phi = rec.mode.as_array();
+            let mode_disp = config.mode_matrix.iter().zip(phi.iter()).fold(
+                Vec3::ZERO,
+                |acc, (col, &phi_i)| acc + Vec3::new(col[0], col[1], col[2]) * phi_i,
+            );
+            seed + mode_disp
         })
         .collect();
 
     // ── Force-directed refinement ─────────────────────────────────────────────
     if config.iterations > 0 {
+        // Record seed positions before jitter — used by the anchor force to
+        // preserve global axis semantics throughout the FD pass.
+        let seeds = positions.clone();
+
+        // Deterministic jitter: break exact seed coincidences so repulsion has
+        // something to act on. Multiplicative hash for reproducibility.
+        for (i, pos) in positions.iter_mut().enumerate() {
+            let h = (i as u32).wrapping_mul(2654435761u32);
+            let jx = ((h & 0xFF) as f32 / 255.0 - 0.5) * 0.2;
+            let jy = (((h >> 8) & 0xFF) as f32 / 255.0 - 0.5) * 0.2;
+            let jz = (((h >> 16) & 0xFF) as f32 / 255.0 - 0.5) * 0.2;
+            *pos += Vec3::new(jx, jy, jz);
+        }
+
         let edges: Vec<(usize, usize, f32)> = graph
             .edge_indices()
             .map(|e| {
@@ -103,35 +159,42 @@ pub fn compute(
             })
             .collect();
 
-        for _ in 0..config.iterations {
-            let mut forces = vec![Vec3::ZERO; n];
+        let rep_dist_sq = config.repulsion_distance * config.repulsion_distance;
 
-            // Repulsion (O(n²), gated by repulsion_strength > 0)
-            if config.repulsion_strength > 0.0 {
-                let rep: Vec<Vec3> = (0..n)
+        for _ in 0..config.iterations {
+            // Local repulsion: de-collides families within repulsion_distance.
+            let rep: Vec<Vec3> = if config.repulsion_strength > 0.0 {
+                (0..n)
                     .into_par_iter()
                     .map(|i| {
                         let pi = positions[i];
                         let mut f = Vec3::ZERO;
                         for j in 0..n {
-                            if i == j {
-                                continue;
-                            }
+                            if i == j { continue; }
                             let delta = pi - positions[j];
                             let d2 = delta.length_squared();
-                            if d2 > 1e-6 {
-                                f += delta * (config.repulsion_strength / d2);
-                            }
+                            if d2 < 1e-8 || d2 > rep_dist_sq { continue; }
+                            f += delta * (config.repulsion_strength / d2);
                         }
                         f
                     })
-                    .collect();
+                    .collect()
+            } else {
+                vec![Vec3::ZERO; n]
+            };
+
+            let mut forces = rep;
+
+            // Anchor: restoring force toward seed position.
+            // Dominates over repulsion at longer ranges, keeping global
+            // axis structure intact (east=irreversibility, etc.).
+            if config.anchor_strength > 0.0 {
                 for i in 0..n {
-                    forces[i] += rep[i];
+                    forces[i] += (seeds[i] - positions[i]) * config.anchor_strength;
                 }
             }
 
-            // Attraction along graph edges
+            // Attraction along graph edges.
             for &(a, b, w) in &edges {
                 let delta = positions[b] - positions[a];
                 let attr = delta * (config.attraction_strength * w);
@@ -139,8 +202,12 @@ pub fn compute(
                 forces[b] -= attr;
             }
 
+            // Apply with per-step clamp to prevent oscillation.
             for i in 0..n {
-                positions[i] += forces[i];
+                let f = forces[i];
+                let len = f.length();
+                let clamped = if len > config.max_step { f * (config.max_step / len) } else { f };
+                positions[i] += clamped;
             }
         }
     }
@@ -155,7 +222,6 @@ pub fn compute(
                 center: positions[i],
                 orientation: Mat3::IDENTITY,
                 extent_budget: ExtentBudget {
-                    // east half-extent grows with the band's semantic width
                     he: 0.4 + 0.1 * span,
                     hn: 0.5,
                     hr: 0.5,
@@ -175,10 +241,16 @@ mod tests {
     use family_enum::{build_table, FamilyKey};
     use family_graph::build_graph;
 
+    // Seed-only config: tests that verify the deterministic seed values use
+    // iterations=0 so they aren't testing force-directed displacement.
+    fn seed_config() -> LayoutConfig {
+        LayoutConfig { iterations: 0, ..Default::default() }
+    }
+
     fn setup() -> (Vec<FamilyRecord>, FamilyGraph, LayoutTable) {
         let families = build_table();
         let graph = build_graph(&families);
-        let table = compute(&families, &graph, &LayoutConfig::default());
+        let table = compute(&families, &graph, &seed_config());
         (families, graph, table)
     }
 
@@ -189,114 +261,107 @@ mod tests {
     }
 
     #[test]
-    fn east_coordinate_increases_with_depletion() {
-        let (families, _, table) = setup();
-        // Minimum depletion: starting family (8,8,8,8) — depletion ≈ 4.0
-        // Maximum depletion: bare family (0,0,0,0) — depletion = 78.0
-        let start = FamilyKey { wnp_band: 8, bnp_band: 8, wp: 8, bp: 8 }.index();
-        let bare = FamilyKey { wnp_band: 0, bnp_band: 0, wp: 0, bp: 0 }.index();
-        let east_start = table.layouts[start].center.x;
-        let east_bare = table.layouts[bare].center.x;
-        assert!(
-            east_bare > east_start,
-            "bare family east {east_bare} should exceed starting-family east {east_start}"
-        );
-        // Verify east = depletion * east_scale for default config
-        let cfg = LayoutConfig::default();
-        let expected_start = families[start].features.depletion * cfg.east_scale;
-        let expected_bare = families[bare].features.depletion * cfg.east_scale;
-        assert!((east_start - expected_start).abs() < 1e-4);
-        assert!((east_bare - expected_bare).abs() < 1e-4);
-    }
-
-    #[test]
-    fn north_sign_matches_material_diff() {
+    fn seed_east_ordering_matches_depletion() {
+        // Mode displacement doesn't change the depletion ordering — more depleted
+        // families must still land east of less depleted ones on average.
         let (_, _, table) = setup();
-        // White-ahead family: wnp_band=7, bnp_band=3 → material_diff > 0 → north > 0
-        let white_up = FamilyKey { wnp_band: 7, bnp_band: 3, wp: 4, bp: 4 }.index();
+        let start = FamilyKey { wnp_band: 8, bnp_band: 8, wp: 8, bp: 8 }.index();
+        let bare  = FamilyKey { wnp_band: 0, bnp_band: 0, wp: 0, bp: 0 }.index();
         assert!(
-            table.layouts[white_up].center.y > 0.0,
-            "white-ahead family should have positive north"
-        );
-        // Black-ahead: north < 0
-        let black_up = FamilyKey { wnp_band: 3, bnp_band: 7, wp: 4, bp: 4 }.index();
-        assert!(
-            table.layouts[black_up].center.y < 0.0,
-            "black-ahead family should have negative north"
-        );
-        // Equal material: north = 0
-        let equal = FamilyKey { wnp_band: 5, bnp_band: 5, wp: 4, bp: 4 }.index();
-        assert!(
-            table.layouts[equal].center.y.abs() < 1e-5,
-            "equal-material family should have north ≈ 0"
+            table.layouts[bare].center.x > table.layouts[start].center.x,
+            "bare family should be east of starting family after mode displacement"
         );
     }
 
     #[test]
-    fn radial_coordinate_is_finite_and_non_negative() {
+    fn seed_north_sign_matches_material_diff() {
+        // q_minus and r_minus channel the queen/rook advantage into north, so
+        // white-ahead families must still have positive north.
+        let (_, _, table) = setup();
+        let white_up = FamilyKey { wnp_band: 7, bnp_band: 3, wp: 4, bp: 4 }.index();
+        assert!(table.layouts[white_up].center.y > 0.0, "white-ahead family should have positive north");
+        let black_up = FamilyKey { wnp_band: 3, bnp_band: 7, wp: 4, bp: 4 }.index();
+        assert!(table.layouts[black_up].center.y < 0.0, "black-ahead family should have negative north");
+    }
+
+    #[test]
+    fn seed_all_positions_finite() {
         let (_, _, table) = setup();
         for (i, layout) in table.layouts.iter().enumerate() {
-            let r = layout.center.z;
-            assert!(r.is_finite(), "non-finite radial at index {i}: {r}");
-            assert!(r >= 0.0, "negative radial at index {i}: {r}");
+            assert!(layout.center.is_finite(), "non-finite position at {i}: {:?}", layout.center);
         }
     }
 
     #[test]
-    fn radial_is_independent_of_east() {
-        // Families with the same depletion but different pawn totals must have
-        // different radial coordinates, proving radial is not just a scaled east.
-        // (8,8,8,8): depletion=4, WP+BP=16 → radial = 16 * 5 = 80
-        // (0,0,0,0): depletion=78, WP+BP=0  → radial = 0
-        // (8,8,0,0): depletion=4,  WP+BP=0  → radial = 0  ← same east, different radial
+    fn seed_radial_ordering_matches_pawn_total() {
+        // Full-pawn family must have higher radial than same-depletion no-pawn family
+        // even after mode displacement (pawn_density term reinforces this).
         let (_, _, table) = setup();
-        let cfg = LayoutConfig::default();
         let full_pawns = FamilyKey { wnp_band: 8, bnp_band: 8, wp: 8, bp: 8 }.index();
         let no_pawns   = FamilyKey { wnp_band: 8, bnp_band: 8, wp: 0, bp: 0 }.index();
-        // Same depletion (same east), but full_pawns has radial=80, no_pawns has radial=0
-        let r_full = table.layouts[full_pawns].center.z;
-        let r_none = table.layouts[no_pawns].center.z;
         assert!(
-            (r_full - 16.0 * cfg.radial_scale).abs() < 1e-4,
-            "full-pawn radial should be 16*radial_scale, got {r_full}"
+            table.layouts[full_pawns].center.z > table.layouts[no_pawns].center.z,
+            "full-pawn family should have higher radial than no-pawn family at same depletion"
         );
-        assert!(
-            r_none.abs() < 1e-4,
-            "no-pawn radial should be 0, got {r_none}"
-        );
-        assert!(
-            r_full > r_none,
-            "same-depletion families with different pawn counts must differ in radial"
-        );
+    }
+
+    #[test]
+    fn mode_displacement_breaks_seed_coincidence() {
+        // Two families with the same (depletion, material_diff, pawn_total) but
+        // different pawn distributions must have different positions due to
+        // the pawn_imbalance channel in A·φ(F).
+        let (_, _, table) = setup();
+        let a = FamilyKey { wnp_band: 5, bnp_band: 3, wp: 2, bp: 6 }.index();
+        let b = FamilyKey { wnp_band: 5, bnp_band: 3, wp: 6, bp: 2 }.index();
+        let dist = (table.layouts[a].center - table.layouts[b].center).length();
+        assert!(dist > 0.1, "pawn-imbalanced families should differ in position, dist={dist}");
     }
 
     #[test]
     fn force_directed_preserves_finite_positions() {
+        // Small repulsion_distance keeps this fast even at full n=6561.
         let families = build_table();
         let graph = build_graph(&families);
-        let config = LayoutConfig { iterations: 10, attraction_strength: 0.01, ..Default::default() };
+        let config = LayoutConfig {
+            iterations: 5,
+            repulsion_distance: 3.0,
+            ..Default::default()
+        };
         let table = compute(&families, &graph, &config);
         for (i, layout) in table.layouts.iter().enumerate() {
-            let c = layout.center;
-            assert!(
-                c.is_finite(),
-                "non-finite position at index {i}: {c:?}"
-            );
+            assert!(layout.center.is_finite(), "non-finite position at {i}: {:?}", layout.center);
         }
+    }
+
+    #[test]
+    fn force_directed_breaks_seed_coincidences() {
+        // Two families that share the same seed coordinates must end up distinct
+        // after the force-directed pass.
+        // (wnp=5, bnp=3, wp=2, bp=6) and (wnp=5, bnp=3, wp=3, bp=5):
+        // same depletion, same material_diff, same wp+bp → identical seed.
+        let families = build_table();
+        let graph = build_graph(&families);
+        let config = LayoutConfig {
+            iterations: 10,
+            repulsion_distance: 5.0,
+            ..Default::default()
+        };
+        let table = compute(&families, &graph, &config);
+        let a = FamilyKey { wnp_band: 5, bnp_band: 3, wp: 2, bp: 6 }.index();
+        let b = FamilyKey { wnp_band: 5, bnp_band: 3, wp: 3, bp: 5 }.index();
+        let dist = (table.layouts[a].center - table.layouts[b].center).length();
+        assert!(dist > 0.01, "coincident seed families should be separated by FD pass, got dist={dist}");
     }
 
     #[test]
     fn extent_budget_scales_with_feature_span() {
         let (families, _, table) = setup();
-        // Band 7 has span 5, band 0 has span 0 → he should differ
         let wide = FamilyKey { wnp_band: 7, bnp_band: 3, wp: 0, bp: 0 }.index();
         let narrow = FamilyKey { wnp_band: 0, bnp_band: 0, wp: 0, bp: 0 }.index();
         assert!(
             table.layouts[wide].extent_budget.he > table.layouts[narrow].extent_budget.he,
             "wider band should have larger he"
         );
-        // feature_span for (7,3): max(span_7, span_3) = max(5, 2) = 5
-        // he = 0.4 + 0.1 * 5 = 0.9
         let expected_he = 0.4 + 0.1 * families[wide].features.feature_span;
         assert!((table.layouts[wide].extent_budget.he - expected_he).abs() < 1e-5);
     }

@@ -1,4 +1,5 @@
 mod camera;
+mod font;
 mod renderer;
 
 use camera::{projection_matrix, Camera};
@@ -138,7 +139,7 @@ fn find_hovered(
     let cy = cursor_px.1 as f32;
 
     let mut best_idx: Option<usize> = None;
-    let mut best_dist_sq = f32::MAX;
+    let mut best_depth = f32::MAX; // clip.w = view-space depth; smaller = closer
 
     for (i, fl) in layout.layouts.iter().enumerate() {
         let p = fl.center;
@@ -151,24 +152,43 @@ fn find_hovered(
         let sx = (ndc_x + 1.0) * 0.5 * win_w as f32;
         let sy = (1.0 - ndc_y) * 0.5 * win_h as f32;
 
-        // Billboard screen radius: world half-size projected via perspective
-        // proj[1][1] = 1/tan(fov/2). radius_px ≈ world_size * proj[1][1] / clip.w * (height/2)
         let world_radius = fl.extent_budget.he * 1.5;
-        let proj11 = proj.col(1)[1]; // = 1/tan(fov_y/2)
+        let proj11 = proj.col(1)[1];
         let radius_px = (world_radius * proj11 / clip.w * win_h as f32 * 0.5).max(6.0);
 
         let dx = sx - cx;
         let dy = sy - cy;
         let dist_sq = dx * dx + dy * dy;
-        let r_sq = radius_px * radius_px;
 
-        if dist_sq <= r_sq && dist_sq < best_dist_sq {
-            best_dist_sq = dist_sq;
+        // Select frontmost (smallest clip.w) family whose circle contains the cursor.
+        if dist_sq <= radius_px * radius_px && clip.w < best_depth {
+            best_depth = clip.w;
             best_idx = Some(i);
         }
     }
 
     best_idx
+}
+
+const LAYOUT_ARTIFACT: &str = "family_layout.bin";
+
+fn load_or_compute_layout(
+    families: &[FamilyRecord],
+    graph: &family_graph::FamilyGraph,
+) -> LayoutTable {
+    if let Ok(bytes) = std::fs::read(LAYOUT_ARTIFACT) {
+        match bincode::deserialize::<LayoutTable>(&bytes) {
+            Ok(layout) if layout.layouts.len() == families.len() => {
+                eprintln!("Loaded layout from {LAYOUT_ARTIFACT}");
+                return layout;
+            }
+            Ok(_) => eprintln!("WARN: {LAYOUT_ARTIFACT} family count mismatch — recomputing"),
+            Err(e) => eprintln!("WARN: {LAYOUT_ARTIFACT} deserialize error: {e} — recomputing"),
+        }
+    } else {
+        eprintln!("No {LAYOUT_ARTIFACT} found — computing layout (run settle-family-layout for the offline artifact)");
+    }
+    compute(families, graph, &LayoutConfig::default())
 }
 
 struct State {
@@ -191,8 +211,8 @@ impl State {
         let families = build_table();
         eprintln!("Building family graph...");
         let graph = build_graph(&families);
-        eprintln!("Computing layout...");
-        let layout = compute(&families, &graph, &LayoutConfig::default());
+
+        let layout = load_or_compute_layout(&families, &graph);
 
         eprintln!(
             "Layout ready: {} families, {} graph edges",
@@ -206,8 +226,11 @@ impl State {
         let edge_verts = build_edge_vertices(&layout, &graph);
         let renderer = Renderer::new(window.clone(), &layout, &families, edge_verts).await;
 
-        let focus = Vec3::new(40.0, 0.0, 40.0);
-        let camera = Camera::new(focus, 0.3, 0.25, 180.0);
+        let n = layout.layouts.len() as f32;
+        let focus = layout.layouts.iter().map(|fl| fl.center).fold(Vec3::ZERO, |a, c| a + c) / n;
+        let max_dist = layout.layouts.iter().map(|fl| (fl.center - focus).length())
+            .fold(0.0_f32, f32::max);
+        let camera = Camera::new(focus, 0.3, 0.25, max_dist * 2.2);
 
         eprintln!("GPU renderer ready — entering event loop");
         eprintln!("Axes (lines through cloud centroid):");
@@ -309,12 +332,15 @@ impl State {
                 let k = &rec.key;
                 let f = &rec.features;
                 let c = self.layout.layouts[idx].center;
-                eprintln!(
-                    "hover  wnp={} bnp={} wp={} bp={}  depletion={:.1}  mat_diff={:.1}  pawns={}  pos=({:.1},{:.1},{:.1})",
+                let text = format!(
+                    "wnp={} bnp={} wp={} bp={}\ndep={:.1} mat={:+.1} pawn={}\npos=({:.1},{:.1},{:.1})",
                     k.wnp_band, k.bnp_band, k.wp, k.bp,
                     f.depletion, f.material_diff, k.wp + k.bp,
-                    c.x, c.y, c.z
+                    c.x, c.y, c.z,
                 );
+                self.renderer.set_hover_text(Some(&text));
+            } else {
+                self.renderer.set_hover_text(None);
             }
         }
     }
@@ -452,13 +478,8 @@ impl ApplicationHandler for App {
         &mut self,
         _event_loop: &ActiveEventLoop,
         _device_id: DeviceId,
-        event: DeviceEvent,
+        _event: DeviceEvent,
     ) {
-        match &event {
-            DeviceEvent::MouseMotion { delta } => eprintln!("DeviceEvent::MouseMotion  {delta:?}"),
-            DeviceEvent::Button { button, state } => eprintln!("DeviceEvent::Button  btn={button}  state={state:?}"),
-            _ => {}
-        }
     }
 }
 

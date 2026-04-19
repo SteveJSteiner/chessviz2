@@ -7,7 +7,10 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::camera::{projection_matrix, Camera};
+use crate::font::make_font;
 use crude_layout::LayoutTable;
+
+const MAX_GLYPHS: u64 = 512;
 
 // ── Color modes ───────────────────────────────────────────────────────────────
 
@@ -114,6 +117,29 @@ fn family_color(rec: &FamilyRecord, mode: ColorMode) -> [f32; 4] {
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
+struct TextParams {
+    x0_px:      f32,
+    y0_px:      f32,
+    char_w_px:  f32,
+    char_h_px:  f32,
+    glyph_w_px: f32,
+    glyph_h_px: f32,
+    screen_w:   f32,
+    screen_h:   f32,
+}
+
+/// One entry per glyph: column, row, ASCII code, pad.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct GlyphEntry {
+    col:  u32,
+    row:  u32,
+    code: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
 struct CameraUniforms {
     view_proj: [[f32; 4]; 4],
     right: [f32; 3],
@@ -160,6 +186,12 @@ pub struct Renderer {
 
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+
+    text_pipeline: wgpu::RenderPipeline,
+    text_bind_group: wgpu::BindGroup,
+    text_glyphs_buf: wgpu::Buffer,
+    text_params_buf: wgpu::Buffer,
+    text_glyph_count: u32,
 
     pub color_mode: ColorMode,
     pub show_edges: bool,
@@ -397,15 +429,16 @@ impl Renderer {
             .collect();
 
         // ── Axis lines ──────────────────────────────────────────────────────
-        // Three lines through the cloud centroid (40, 0, 40), extending beyond
-        // the cloud bounds so they frame the space.
-        // Red   = east  (x, depletion — more depleted → more east)
-        // Green = north (y, material_diff — white ahead → north)
-        // Blue  = radial (z, pawn count — more pawns → deeper in)
-        let cx = 40.0_f32;
-        let cy = 0.0_f32;
-        let cz = 40.0_f32;
-        let ext = 70.0_f32; // extension beyond centroid in each direction
+        // Three lines through the actual cloud centroid, scaled to the cloud bounds.
+        let n = layout.layouts.len() as f32;
+        let centroid = layout.layouts.iter().map(|fl| fl.center)
+            .fold(glam::Vec3::ZERO, |a, c| a + c) / n;
+        let max_dist = layout.layouts.iter().map(|fl| (fl.center - centroid).length())
+            .fold(0.0_f32, f32::max);
+        let cx = centroid.x;
+        let cy = centroid.y;
+        let cz = centroid.z;
+        let ext = max_dist * 0.8;
         let red   = [1.0_f32, 0.25, 0.25, 1.0];
         let green = [0.25_f32, 1.0, 0.35, 1.0];
         let blue  = [0.35_f32, 0.55, 1.0, 1.0];
@@ -435,6 +468,107 @@ impl Renderer {
         let (depth_texture, depth_view) =
             make_depth_texture(&device, size.width, size.height, depth_format);
 
+        // ── Text overlay pipeline ───────────────────────────────────────────
+        let font_data = make_font();
+        let font_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("font"),
+            contents: bytemuck::cast_slice(&font_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let text_glyphs_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("text_glyphs"),
+            size: MAX_GLYPHS * std::mem::size_of::<GlyphEntry>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let text_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("text_params"),
+            size: std::mem::size_of::<TextParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let text_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("text_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let text_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("text_bg"),
+            layout: &text_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: font_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: text_glyphs_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: text_params_buf.as_entire_binding() },
+            ],
+        });
+        let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("text_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("text_shader.wgsl").into()),
+        });
+        let text_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&text_bgl],
+            push_constant_ranges: &[],
+        });
+        let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("text"),
+            layout: Some(&text_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &text_shader,
+                entry_point: "vs_text",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &text_shader,
+                entry_point: "fs_text",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         Renderer {
             surface,
             device,
@@ -452,9 +586,56 @@ impl Renderer {
             edge_vertex_count,
             depth_texture,
             depth_view,
+            text_pipeline,
+            text_bind_group,
+            text_glyphs_buf,
+            text_params_buf,
+            text_glyph_count: 0,
             color_mode: ColorMode::Depletion,
             show_edges: false,
         }
+    }
+
+    pub fn set_hover_text(&mut self, text: Option<&str>) {
+        let Some(t) = text else {
+            self.text_glyph_count = 0;
+            return;
+        };
+
+        let mut glyphs: Vec<GlyphEntry> = Vec::new();
+        let mut col = 0u32;
+        let mut row = 0u32;
+        for ch in t.chars() {
+            if ch == '\n' {
+                row += 1;
+                col = 0;
+                continue;
+            }
+            let code = ch as u32;
+            if (32..128).contains(&code) && glyphs.len() < MAX_GLYPHS as usize {
+                glyphs.push(GlyphEntry { col, row, code, _pad: 0 });
+                col += 1;
+            }
+        }
+
+        self.text_glyph_count = glyphs.len() as u32;
+        if glyphs.is_empty() {
+            return;
+        }
+
+        self.queue.write_buffer(&self.text_glyphs_buf, 0, bytemuck::cast_slice(&glyphs));
+
+        let params = TextParams {
+            x0_px:      14.0,
+            y0_px:      14.0,
+            char_w_px:  26.0,  // 24 glyph + 2 gap at 3× scale
+            char_h_px:  30.0,  // 24 glyph + 6 line gap
+            glyph_w_px: 24.0,
+            glyph_h_px: 24.0,
+            screen_w:   self.size.width as f32,
+            screen_h:   self.size.height as f32,
+        };
+        self.queue.write_buffer(&self.text_params_buf, 0, bytemuck::bytes_of(&params));
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -542,6 +723,27 @@ impl Renderer {
             rpass.set_pipeline(&self.family_pipeline);
             rpass.set_vertex_buffer(0, self.family_instance_bufs[mode_idx].slice(..));
             rpass.draw(0..6, 0..self.family_instance_count);
+        }
+
+        // Text overlay (second pass — loads 3D scene, no depth)
+        if self.text_glyph_count > 0 {
+            let mut tpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("text_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            tpass.set_pipeline(&self.text_pipeline);
+            tpass.set_bind_group(0, &self.text_bind_group, &[]);
+            tpass.draw(0..6, 0..self.text_glyph_count);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

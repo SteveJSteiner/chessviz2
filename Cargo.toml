@@ -6,6 +6,7 @@ members = [
     "crates/viewer",
     "crates/placement-codec",
     "crates/legality-predicate",
+    "crates/settle-family-layout",
 ]
 resolver = "2"
 
