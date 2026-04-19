@@ -59,8 +59,10 @@ impl State {
 
         let renderer = Renderer::new(window.clone(), &layout, edge_verts).await;
 
-        // Start camera behind the mass of glyphs, looking in
-        let camera = Camera::new(Vec3::new(40.0, 0.0, -60.0));
+        // Layout: x=[4,78] (depletion), y≈[-58,58] (material diff), z=[0,40] (phase).
+        // Start behind the cloud in -Z, looking along +Z (yaw = π/2).
+        let mut camera = Camera::new(Vec3::new(40.0, 0.0, -120.0));
+        camera.yaw = std::f32::consts::FRAC_PI_2;
 
         State {
             window,

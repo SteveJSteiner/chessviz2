@@ -21,7 +21,7 @@ impl Camera {
     }
 
     pub fn right(&self) -> Vec3 {
-        self.forward().cross(Vec3::Y).normalize()
+        Vec3::Y.cross(self.forward()).normalize()
     }
 
     pub fn up(&self) -> Vec3 {
