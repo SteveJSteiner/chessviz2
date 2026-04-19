@@ -1,0 +1,12 @@
+[package]
+name    = "crude-layout"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+family-enum  = { workspace = true }
+family-graph = { workspace = true }
+serde        = { workspace = true }
+bincode      = { workspace = true }
+glam         = { workspace = true }
+rayon        = { workspace = true }

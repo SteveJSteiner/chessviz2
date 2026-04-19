@@ -1,0 +1,10 @@
+[package]
+name    = "family-graph"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+family-enum = { workspace = true }
+serde       = { workspace = true }
+bincode     = { workspace = true }
+petgraph    = { workspace = true }

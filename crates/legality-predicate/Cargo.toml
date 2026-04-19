@@ -1,0 +1,8 @@
+[package]
+name    = "legality-predicate"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shakmaty        = { workspace = true }
+placement-codec = { workspace = true }

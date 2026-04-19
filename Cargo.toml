@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "crates/family-enum",
+    "crates/family-graph",
+    "crates/crude-layout",
+    "crates/viewer",
+    "crates/placement-codec",
+    "crates/legality-predicate",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+family-enum      = { path = "crates/family-enum" }
+family-graph     = { path = "crates/family-graph" }
+crude-layout     = { path = "crates/crude-layout" }
+placement-codec  = { path = "crates/placement-codec" }
+
+serde    = { version = "1", features = ["derive"] }
+bincode  = "1"
+petgraph = { version = "0.6", features = ["serde-1"] }
+glam     = { version = "0.27", features = ["serde"] }
+shakmaty = "0.27"
+rayon    = "1"

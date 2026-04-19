@@ -1,0 +1,9 @@
+[package]
+name    = "placement-codec"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shakmaty = { workspace = true }
+serde    = { workspace = true }
+bincode  = { workspace = true }
